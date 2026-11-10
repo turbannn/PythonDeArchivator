@@ -28,14 +28,13 @@ them. Values can be quoted; quotes preserve leading/trailing spaces in search te
 `#` and `=` inside a value remain literal. Empty search text is rejected.
 Settings and results are located beside the script even when launched elsewhere.
 
-The app searches all folders, including stored Sent and Deleted Items. It checks
-subjects, plain text, HTML source and decoded HTML text, decompressed rich text,
-transport headers (including encoded words), all textual MAPI properties,
-recipient details, and attachment names/metadata. It also searches plain text
-attachments and embedded email messages. Each parent email counts once, even if
-several fields or embedded messages match. PDFs, Office documents, images, ZIPs,
-encrypted contents and other binary attachments are not text-extracted or OCR'd.
-Permanently deleted items outside the folder tree are not recovered.
+The app searches all folders, including stored Sent and Deleted Items. Search and
+saved results are intentionally limited to reader-facing fields: subject, one
+readable body (`plain text`, otherwise decoded HTML text, otherwise decompressed
+rich text), sent/received dates, sender, and To/Cc/Bcc recipients. Raw HTML,
+transport headers, MAPI properties, attachment metadata/content, and embedded
+messages are excluded. Each email counts once even when several visible fields
+match. Permanently deleted items outside the folder tree are not recovered.
 
 After a successful scan with matches, the console displays:
 
@@ -47,8 +46,9 @@ Enter `y` (or `Y`) to save. Enter, `n`, or any other response declines.
 With zero matches it only reports `No emails found containing this text.` and
 does not prompt. Progress appears every 100 scanned emails.
 
-Results are UTF-8 text containing the matching emails' readable fields, bodies,
-headers, folder locations and the names of fields that matched. Output filenames
+Results are UTF-8 text containing only the matching emails' subject, readable
+body, dates, sender and recipients. Internal folder, message/property IDs and
+match diagnostics are not written. Output filenames
 use local time: `14-30-05_2026-10-22.txt`. Windows forbids `:` in filenames, so the
 requested time/date separator is represented by `_` and time separators by `-`.
 If a filename already exists, a numeric suffix prevents overwriting it.

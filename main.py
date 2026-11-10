@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from email.header import decode_header
 from html.parser import HTMLParser
 from pathlib import Path
 import sys
@@ -20,17 +19,6 @@ except ImportError as exc:
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
-TEXT_TYPES = {0x001E, 0x001F, 0x101E, 0x101F}
-PROPERTY_NAMES = {
-    0x001A: "Message class", 0x0037: "Subject", 0x007D: "Headers",
-    0x0C1A: "Sender name", 0x0C1F: "Sender address",
-    0x0E02: "Bcc", 0x0E03: "Cc", 0x0E04: "To",
-    0x1000: "Body", 0x3001: "Display name", 0x3003: "Email address",
-    0x3704: "Attachment filename", 0x3707: "Attachment long filename",
-    0x39FE: "SMTP address", 0x5D01: "Sender SMTP address",
-}
-
-
 @dataclass
 class Settings:
     pst_path: Path
@@ -100,13 +88,6 @@ def decode_bytes(data: bytes, encoding: str = "utf-8", fallback: str | None = No
     return data.decode(replacement_codec, errors="replace")
 
 
-def decoded_header(value: str) -> str:
-    return "".join(
-        decode_bytes(part, charset or "ascii") if isinstance(part, bytes) else part
-        for part, charset in decode_header(value)
-    )
-
-
 class HTMLText(HTMLParser):
     """Keep inline text contiguous, but separate paragraphs, rows and breaks."""
 
@@ -141,62 +122,51 @@ def html_text(value: str) -> str:
     return "".join(parser.parts)
 
 
-def property_fields(properties, prefix=""):
-    """Read all textual MAPI properties, including custom and multi-value fields."""
-    for prop_id, record in properties.records.items():
-        if record.is_null or int(record.value_type) not in TEXT_TYPES:
-            continue
-        value = properties.read(record)
-        label = prefix + PROPERTY_NAMES.get(prop_id, f"Property 0x{prop_id:04X}")
-        for text in value if isinstance(value, (tuple, list)) else [value]:
-            if text:
-                yield label, text
-                if "=?" in text:
-                    yield label + " (decoded)", decoded_header(text)
+def format_person(name: str | None, email: str | None, smtp: str | None = None) -> str:
+    address = smtp or email
+    if name and address and name.casefold() != address.casefold():
+        return f"{name} <{address}>"
+    return address or name or ""
 
 
-def message_fields(message, prefix=""):
-    yield prefix + "Subject", message.subject or ""
-    yield from property_fields(message.properties, prefix)
+def message_fields(message):
+    """Yield only reader-facing email content, without raw MAPI metadata."""
+    if message.subject:
+        yield "Subject", message.subject
+
+    sender = format_person(message.sender_name, message.sender_email, message.sender_smtp)
+    recipients = {"To": [], "Cc": [], "Bcc": []}
+    for recipient in message.recipients():
+        person = format_person(recipient.name, recipient.email, recipient.smtp)
+        label = {0: "From", 1: "To", 2: "Cc", 3: "Bcc"}.get(int(recipient.type))
+        if label == "From" and not sender:
+            sender = person
+        elif label in recipients and person and person not in recipients[label]:
+            recipients[label].append(person)
+
+    if sender:
+        yield "From", sender
+    for label, people in recipients.items():
+        if people:
+            yield label, "; ".join(people)
+
     for label, value in (("Sent", message.client_submit_time), ("Received", message.delivery_time)):
         if value is not None:
-            yield prefix + label, str(value)
+            yield label, str(value)
 
+    body = message.body_text
     codepage = message.get(0x3FDE)  # PidTagInternetCodepage
     codec = {65001: "utf-8", 1200: "utf-16-le", 1201: "utf-16-be"}.get(
         codepage, f"cp{codepage}" if codepage else message.store.codepage
     )
-    if message.body_html:
+    if not body and message.body_html:
         html = decode_bytes(message.body_html, codec)
-        yield prefix + "HTML source", html
-        yield prefix + "HTML text", html_text(html)
-    rtf = message.body_rtf_decompressed()
-    if rtf:
+        body = html_text(html)
+    if not body and (rtf := message.body_rtf_decompressed()):
         # Latin-1 preserves bytes; striprtf interprets RTF's own codepage/escapes.
-        yield prefix + "Rich text", rtf_to_text(rtf.decode("latin-1"))
-
-    for index, recipient in enumerate(message.recipients(), 1):
-        for prop_id, value in recipient.properties.items():
-            for text in value if isinstance(value, (tuple, list)) else [value]:
-                if isinstance(text, str) and text:
-                    yield prefix + f"Recipient {index} / 0x{prop_id:04X}", text
-
-    for index, attachment in enumerate(message.attachments(), 1):
-        label = prefix + f"Attachment {index} / "
-        yield from property_fields(attachment.properties, label)
-        embedded = attachment.embedded_message()
-        if embedded is not None:
-            yield from message_fields(embedded, label + "Embedded email / ")
-        else:
-            name = attachment.long_filename or attachment.filename or ""
-            mime = (attachment.mime_tag or "").lower()
-            if mime.startswith("text/") or Path(name).suffix.lower() in {".txt", ".csv", ".html", ".htm", ".xml", ".json"}:
-                data = attachment.data()
-                if data:
-                    text = decode_bytes(data, fallback=message.store.codepage)
-                    yield label + "Text content", text
-                    if "html" in mime or Path(name).suffix.lower() in {".html", ".htm"}:
-                        yield label + "HTML text", html_text(text)
+        body = rtf_to_text(rtf.decode("latin-1"))
+    if body:
+        yield "Text", body
 
 
 def find_matches(settings: Settings) -> list[Match]:
@@ -235,8 +205,7 @@ def write_results(matches: list[Match], settings: Settings, directory: Path) -> 
         output.write(f"PST: {settings.pst_path}\nSearch text: {settings.search_text}\n")
         output.write(f"Created: {now.isoformat()}\nMatching emails: {len(matches)}\n")
         for index, match in enumerate(matches, 1):
-            output.write(f"\n{'=' * 72}\nEmail {index}\nFolder: {match.folder}\n")
-            output.write(f"Message ID: {match.message_id}\nMatched fields: {', '.join(match.matched_fields)}\n")
+            output.write(f"\n{'=' * 72}\nEmail {index}\n")
             for label, value in match.fields:
                 output.write(f"\n--- {label} ---\n{value}\n")
     return target

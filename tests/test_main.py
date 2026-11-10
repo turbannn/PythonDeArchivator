@@ -25,6 +25,7 @@ class Properties:
 def fake_message(values=None, **overrides):
     fields = dict(
         subject="Example", properties=Properties(values or {}),
+        sender_name=None, sender_email=None, sender_smtp=None, body_text=None,
         client_submit_time=None, delivery_time=None,
         get=lambda key: 65001, store=SimpleNamespace(codepage="cp1252"),
         body_html=None, body_rtf_decompressed=lambda: None,
@@ -35,11 +36,11 @@ def fake_message(values=None, **overrides):
 
 
 class SearchTests(unittest.TestCase):
-    def test_substring_in_all_text_fields_counts_message_once(self):
+    def test_searches_only_visible_fields_and_counts_message_once(self):
         messages = [
-            fake_message({0x0037: "S1231231231", 0x1000: "also 1231231231"}, node="1"),
-            fake_message({0x7777: "Custom 1231231231 metadata"}, node="2"),
-            fake_message({0x1000: "not a match"}, node="3"),
+            fake_message(body_text="also 1231231231", node="1"),
+            fake_message(subject="S1231231231", node="2"),
+            fake_message({0x7777: "hidden 1231231231 metadata"}, node="3"),
         ]
         root = SimpleNamespace(messages=lambda: iter(messages[:1]))
         nested = SimpleNamespace(messages=lambda: iter(messages[1:]))
@@ -50,55 +51,46 @@ class SearchTests(unittest.TestCase):
             matches = main.find_matches(main.Settings(Path("unused.pst"), "1231231231"))
         self.assertEqual(len(matches), 2)
         self.assertEqual(matches[1].folder, "Root/Inbox/Nested")
-        self.assertEqual(matches[0].matched_fields, ["Subject", "Body"])
+        self.assertEqual(matches[0].matched_fields, ["Text"])
 
-    def test_formatted_html_unicode_and_rtf(self):
+    def test_uses_one_readable_body_without_html_source_or_duplicate_rtf(self):
         message = fake_message(
             body_html="<style>hidden</style><p>S123<b>123</b>123&#49;</p><p>Привіт</p>".encode(),
             body_rtf_decompressed=lambda: br"{\rtf1\ansi S123{\b 123}1231}",
         )
         fields = dict(main.message_fields(message))
-        self.assertIn("S1231231231", fields["HTML text"])
-        self.assertIn("Привіт", fields["HTML text"])
-        self.assertNotIn("hidden", fields["HTML text"])
-        self.assertIn("S1231231231", fields["Rich text"])
-
-    def test_encoded_header(self):
-        fields = dict(main.message_fields(fake_message({0x0037: "=?utf-8?b?UzEyMzEyMzEyMzE=?="})))
-        self.assertEqual(fields["Subject (decoded)"], "S1231231231")
+        self.assertIn("S1231231231", fields["Text"])
+        self.assertIn("Привіт", fields["Text"])
+        self.assertNotIn("hidden", fields["Text"])
+        self.assertEqual(set(fields), {"Subject", "Text"})
 
     def test_undefined_cp1252_byte_does_not_abort_html_scan(self):
         message = fake_message(body_html=b"before \x90 S1231231231 after", get=lambda key: 1252)
         fields = dict(main.message_fields(message))
-        self.assertEqual(fields["HTML text"], "before \ufffd S1231231231 after")
+        self.assertEqual(fields["Text"], "before \ufffd S1231231231 after")
 
-    def test_text_attachment_uses_store_codepage_and_replaces_bad_byte(self):
+    def test_keeps_sender_recipients_and_dates(self):
         attachment = SimpleNamespace(
-            properties=Properties({}), embedded_message=lambda: None,
-            long_filename="example.txt", filename=None, mime_tag="text/plain",
-            data=lambda: b"caf\xe9 \x90 1231231231",
+            properties=Properties({0x3707: "hidden 1231231231.txt"}), embedded_message=lambda: None,
         )
-        fields = dict(main.message_fields(fake_message(attachments=lambda: [attachment])))
-        self.assertEqual(fields["Attachment 1 / Text content"], "caf\u00e9 \ufffd 1231231231")
-
-    def test_recipient_text_attachment_and_embedded_email(self):
-        embedded = fake_message({0x1000: "embedded 1231231231"})
-        text = SimpleNamespace(
-            properties=Properties({0x3707: "S1231231231.txt"}),
-            embedded_message=lambda: None, long_filename="S1231231231.txt",
-            filename=None, mime_tag="text/plain", data=lambda: b"attached 1231231231",
+        recipient = SimpleNamespace(
+            type=1, name="Recipient", email="legacy@example.com",
+            smtp="recipient@example.com", properties={},
         )
-        attached_email = SimpleNamespace(properties=Properties({}), embedded_message=lambda: embedded)
         fields = dict(main.message_fields(fake_message(
-            recipients=lambda: [SimpleNamespace(properties={0x3003: "1231231231@example.com"})],
-            attachments=lambda: [text, attached_email],
+            sender_name="Sender", sender_email="legacy-sender@example.com",
+            sender_smtp="sender@example.com", recipients=lambda: [recipient],
+            client_submit_time=datetime(2026, 1, 2, 3, 4, 5),
+            delivery_time=datetime(2026, 1, 2, 3, 5, 6), attachments=lambda: [attachment],
         )))
-        self.assertIn("1231231231", fields["Recipient 1 / 0x3003"])
-        self.assertIn("1231231231", fields["Attachment 1 / Text content"])
-        self.assertIn("1231231231", fields["Attachment 2 / Embedded email / Body"])
+        self.assertEqual(fields["From"], "Sender <sender@example.com>")
+        self.assertEqual(fields["To"], "Recipient <recipient@example.com>")
+        self.assertEqual(fields["Sent"], "2026-01-02 03:04:05")
+        self.assertEqual(fields["Received"], "2026-01-02 03:05:06")
+        self.assertFalse(any("Attachment" in label for label in fields))
 
     def test_no_matching_across_unrelated_fields_and_case_insensitivity(self):
-        msg = fake_message({0x0037: "ABC", 0x1000: "def"})
+        msg = fake_message(subject="ABC", body_text="def")
         folder = SimpleNamespace(messages=lambda: iter([msg]))
         with patch.object(main.pypstreader, "open"), patch.object(
             main, "folder_paths", side_effect=lambda *args, **kwargs: [(folder, "Inbox")]
@@ -136,7 +128,7 @@ class ConfigTests(unittest.TestCase):
 class ConsoleTests(unittest.TestCase):
     def setUp(self):
         self.settings = main.Settings(Path("archive.pst"), "1231231231")
-        self.match = main.Match("Inbox", "1", [("Body", "Привіт S1231231231")], ["Body"])
+        self.match = main.Match("Inbox", "1", [("Text", "Привіт S1231231231")], ["Text"])
 
     def run_console(self, matches, answer="", error=None):
         out, err = StringIO(), StringIO()
@@ -208,7 +200,11 @@ class ConsoleTests(unittest.TestCase):
             self.assertEqual(first.name, "14-30-05_2026-10-22.txt")
             self.assertEqual(second.name, "14-30-05_2026-10-22_1.txt")
             self.assertEqual(first.read_bytes(), original)
-            self.assertIn("Привіт S1231231231", first.read_text(encoding="utf-8"))
+            text = first.read_text(encoding="utf-8")
+            self.assertIn("Привіт S1231231231", text)
+            self.assertNotIn("Folder:", text)
+            self.assertNotIn("Message ID:", text)
+            self.assertNotIn("Matched fields:", text)
 
 
 FIXTURES = main.PROJECT_DIR / ".test-data"
@@ -220,8 +216,10 @@ class RealPstTests(unittest.TestCase):
         path = FIXTURES / "tika-variousBodyTypes.pst"
         matches = main.find_matches(main.Settings(path, "original email"))
         self.assertEqual(len(matches), 4)
-        self.assertTrue(any("Rich text" in m.matched_fields for m in matches))
-        self.assertTrue(any("HTML text" in m.matched_fields for m in matches))
+        self.assertTrue(all("Text" in m.matched_fields for m in matches))
+        self.assertTrue(all(set(label for label, _ in m.fields) <= {
+            "Subject", "From", "To", "Cc", "Bcc", "Sent", "Received", "Text"
+        } for m in matches))
         self.assertEqual(main.find_matches(main.Settings(path, "nonexistent-code-1231231231")), [])
 
     @unittest.skipUnless((FIXTURES / "pstsdk-submessage.pst").exists(), "Optional public PST fixture")
@@ -229,7 +227,7 @@ class RealPstTests(unittest.TestCase):
         path = FIXTURES / "pstsdk-submessage.pst"
         matches = main.find_matches(main.Settings(path, "message"))
         self.assertEqual(len(matches), 1)
-        self.assertTrue(any("Embedded email" in field for field in matches[0].matched_fields))
+        self.assertEqual(matches[0].matched_fields, ["Subject", "Text"])
 
 
 if __name__ == "__main__":
