@@ -1,0 +1,2 @@
+pypstreader==1.0.0
+striprtf==0.0.33
